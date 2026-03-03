@@ -1,1 +1,184 @@
-Implement an orchestrator that does intent-based routing to call only the most relevant of GitLab/SharePoint/Jam first, then auto-escalates to additional agents only if confidence is low, results are missing/conflicting, or the query is high-stakes. Require each agent to return structured evidence (snippets + metadata + confidence) so the orchestrator can filter irrelevant items, dedupe/rerank, and answer immediately on a high-confidence early result without waiting for slow agents.
+Here’s how to implement **scored routing + multi-intent detection + automatic escalation** in a way that actually works in production.
+
+## 1) Scored routing (replace “keyword ⇒ agent” with “signals ⇒ scores”)
+
+### A. Compute a score per agent
+
+Instead of hard rules, make each signal add/subtract points.
+
+**Signals**
+
+* **GitLab**
+
+  * MR/issue/commit refs: `!123`, `#456`, SHA, “branch”, “pipeline”, “CI”, “runner”, stacktrace, file paths, repo names
+* **SharePoint**
+
+  * “policy”, “SOP”, “handbook”, “onboarding”, “process”, “template”, “form”, “official”, “guideline”
+* **Jam**
+
+  * “decided”, “agreed”, “discussion”, “thread”, “summary”, “retro”, “RCA”, “who approved”, “timeline”
+
+**Example scoring idea**
+
+* +3: direct URL/ID for that system
+* +2: strong keyword (pipeline/SOP/decided)
+* +1: weak keyword (docs/how-to/notes)
+* −2: explicit exclusion (“not policy”, “not docs”)
+* +2: user asks “who decided/approved” → Jam boost
+* +2: user asks “where in code” → GitLab boost
+
+Then produce:
+
+```json
+{
+  "scores": {"gitlab": 7, "sharepoint": 3, "jam": 2},
+  "ranked": ["gitlab","sharepoint","jam"],
+  "router_confidence": 0.78,
+  "multi_intent": true/false
+}
+```
+
+### B. Decision rule (top-1 vs top-2)
+
+Use **margin**, not just the top score:
+
+* If `top1_score - top2_score >= margin` (e.g. 3 points): call **top-1**
+* Else: call **top-2**
+* If very low scores overall: call **top-2** by default (often GitLab+SharePoint)
+
+This alone fixes a lot of “oops, wrong agent” cases.
+
+---
+
+## 2) Multi-intent detection (how you stop missing “combine both” answers)
+
+Many queries are *two questions in one*. You want to detect that and force multi-source retrieval.
+
+### A. Cheap heuristics that work well
+
+Mark `multi_intent=true` if any of these:
+
+* Query contains conjunction patterns: **“and”, “also”, “plus”, “as well as”**
+* Multiple question marks or multiple interrogatives (“why … and what …”)
+* Two distinct keyword families appear (e.g., “pipeline” + “policy”, “decided” + “implementation”)
+* A “decision + implementation” combo:
+
+  * “what did we decide” (Jam) + “where is it” (GitLab)
+* A “incident + process” combo:
+
+  * “why did it fail” (GitLab) + “what’s the rollback process” (SharePoint)
+
+### B. Intent decomposition (optional but strong)
+
+Split the query into sub-questions:
+
+* Q1: “Why is CI failing?” → GitLab
+* Q2: “What’s the official rollback process?” → SharePoint
+
+Then route each sub-question separately and merge.
+
+This can be rule-based initially; later you can let an LLM do decomposition when the heuristics trigger.
+
+---
+
+## 3) Automatic escalation when evidence is weak (prevents “fast wrong answer”)
+
+Even good routing misses. So after the first agent returns, you decide whether to pull in others.
+
+### A. Define “evidence strength”
+
+Have the orchestrator compute an `evidence_strength` score from the agent’s returned items:
+
+Strong evidence examples:
+
+* high similarity to question
+* authoritative type (merged MR, runbook, official doc, accepted decision summary)
+* multiple independent hits that agree
+* direct match on IDs / exact phrase
+
+A simple metric:
+
+* `top_item_score` (similarity × reliability × authority × recency)
+* count of “strong” items above threshold (e.g. >= 0.65)
+
+### B. Escalation rule (simple)
+
+After agent A responds:
+
+* If `top_item_score >= 0.80` OR `strong_count >= 2` → **answer now**
+* Else → start agent B (next ranked) immediately
+* If still weak after B → start agent C
+
+This prevents the orchestrator from confidently answering from thin evidence.
+
+### C. Time-based escalation
+
+Even if the router was confident, if the first agent hasn’t produced a strong hit quickly:
+
+* at ~3–5 seconds: start second agent
+* at ~6–8 seconds: start third if still weak/high-stakes
+
+---
+
+## 4) Putting it together (the practical control loop)
+
+**Step 0**: Router produces ranked agents + multi_intent flag
+**Step 1**: Dispatch:
+
+* if multi_intent → dispatch top-2 immediately
+* else dispatch top-1
+  **Step 2**: When any agent returns:
+* normalize + filter + global rerank on current evidence
+* if high-confidence gate passes → respond immediately
+* else escalate to next agent(s) until deadline
+  **Step 3**: Late arrivals:
+* only update if they materially improve (beat current best by margin) or reveal a conflict
+
+---
+
+## 5) Defaults that usually work (copy-paste policy)
+
+* Margin for top-1 only: **3 points**
+* strong item threshold: **0.65**
+* early answer threshold: **0.80**
+* start 2nd agent at **5s** if no strong item yet
+* global deadline: **12–15s**
+* “high-stakes intents” always start top-2 immediately:
+
+  * security/compliance, prod incident, access changes, payments, customer-facing impact
+
+---
+
+## 6) Why this fixes your exact bug
+
+Your current keyword rules are doing **hard pruning**. This system:
+
+* still uses keywords (fast),
+* but **doesn’t overcommit** when the query is compound or ambiguous,
+* and it **recovers** via escalation if the chosen source isn’t producing strong evidence.
+
+If you tell me 5–10 example queries that caused misses, I can map them into a routing table (signals + weights + multi-intent patterns) tailored to your org’s language.
+
+
+
+
+**Global reranker goes after you start getting results back**—it’s a **post-collection** step, and you run it **incrementally** each time an agent returns.
+
+### Where it sits in the flow
+
+1. **Router (pre-dispatch)** → chooses which agents to call (top-1/top-2/top-3).
+2. **Agents retrieve** → return structured evidence items.
+3. **Global reranker (post-response)** → **merge + filter + dedupe + rerank** across *all evidence you have so far*.
+4. **Synthesis** → write the answer from the top reranked evidence.
+5. **Late arrivals** → rerank again; only update if it materially improves/conflicts.
+
+### In practice (progressive answering)
+
+* **First agent returns (e.g., at 5s):** run global rerank on that evidence → if confidence gate passes → answer immediately.
+* **Second/third agent returns (later):** run global rerank again including new items → if top evidence changes meaningfully or reveals conflict → update; otherwise ignore.
+
+### Why not pre-dispatch?
+
+Before retrieval you don’t have candidates to rank—pre-dispatch is **routing**, not reranking.
+
+So: **post-collection, and optionally multiple times** (once per arriving agent) to support “answer fast, refine only if needed.”
