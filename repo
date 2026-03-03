@@ -182,3 +182,12 @@ If you tell me 5–10 example queries that caused misses, I can map them into a 
 Before retrieval you don’t have candidates to rank—pre-dispatch is **routing**, not reranking.
 
 So: **post-collection, and optionally multiple times** (once per arriving agent) to support “answer fast, refine only if needed.”
+
+
+Concretely, the “OpenAI-style” approach would look like this:
+Hard contract for tools/agents: each of your GitLab/SharePoint/Jam agents returns only structured evidence (snippets + metadata + confidence), not a final answer.
+Soft routing (not hard keywords): a router produces scores for each agent + detects multi-intent, then chooses top-1/top-2; keywords are just strong features, not absolute gates.
+Speculative execution: start the most likely agent(s) immediately; if confidence is low or the query is multi-intent/high-stakes, start additional agents in parallel.
+Strict SLAs: per-agent timeouts, a global deadline, and cancellation/ignore-late-results so a 30s wrong agent can’t block or pollute.
+Global rerank after results arrive: normalize → permission/scope filters → dedupe → rerank across all evidence (similarity × reliability × authority × recency), optionally LLM-rerank as a tie-breaker on a small shortlist.
+Progressive answer: answer as soon as you have high-confidence evidence, then only update if later evidence materially improves or contradicts the answer (with conflict handling).
